@@ -16,6 +16,7 @@ Run with:
 
 import os
 import numpy as np
+import torch
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import track
@@ -30,13 +31,64 @@ console = Console()
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-TOTAL_TIMESTEPS  = 2_000_000  # Longer training for better convergence
+TOTAL_TIMESTEPS  = int(os.getenv("TOTAL_TIMESTEPS", "2000000"))
 N_ENVS           = 8          # Run 8 environments in parallel (faster)
 MODEL_SAVE_PATH  = "models/ev_ppo_agent"
 LOG_DIR          = "logs/"
+GRID_LIMIT_MIN   = float(os.getenv("GRID_LIMIT_MIN", "85"))
+GRID_LIMIT_MAX   = float(os.getenv("GRID_LIMIT_MAX", "100"))
+EVAL_GRID_LIMIT  = float(os.getenv("EVAL_GRID_LIMIT", "100"))
+
+FAST_RATE_MIN    = float(os.getenv("FAST_RATE_MIN", "8"))
+FAST_RATE_MAX    = float(os.getenv("FAST_RATE_MAX", "12"))
+SLOW_RATE_MIN    = float(os.getenv("SLOW_RATE_MIN", "3"))
+SLOW_RATE_MAX    = float(os.getenv("SLOW_RATE_MAX", "7"))
+FAST_POWER_MIN   = float(os.getenv("FAST_POWER_MIN", "2.5"))
+FAST_POWER_MAX   = float(os.getenv("FAST_POWER_MAX", "4.5"))
+SLOW_POWER_MIN   = float(os.getenv("SLOW_POWER_MIN", "0.8"))
+SLOW_POWER_MAX   = float(os.getenv("SLOW_POWER_MAX", "1.8"))
+AGGR_MIN         = float(os.getenv("AGGR_MIN", "1.0"))
+AGGR_MAX         = float(os.getenv("AGGR_MAX", "1.15"))
+SOFT_MARGIN      = float(os.getenv("SOFT_MARGIN", "5.0"))
+
+EVAL_FAST_RATE   = float(os.getenv("EVAL_FAST_RATE", "10"))
+EVAL_SLOW_RATE   = float(os.getenv("EVAL_SLOW_RATE", "5"))
+EVAL_FAST_POWER  = float(os.getenv("EVAL_FAST_POWER", "3"))
+EVAL_SLOW_POWER  = float(os.getenv("EVAL_SLOW_POWER", "1"))
+EVAL_AGGR        = float(os.getenv("EVAL_AGGR", "1.05"))
+
+GRID_LIMIT_MIN, GRID_LIMIT_MAX = sorted((GRID_LIMIT_MIN, GRID_LIMIT_MAX))
+FAST_RATE_MIN, FAST_RATE_MAX = sorted((FAST_RATE_MIN, FAST_RATE_MAX))
+SLOW_RATE_MIN, SLOW_RATE_MAX = sorted((SLOW_RATE_MIN, SLOW_RATE_MAX))
+FAST_POWER_MIN, FAST_POWER_MAX = sorted((FAST_POWER_MIN, FAST_POWER_MAX))
+SLOW_POWER_MIN, SLOW_POWER_MAX = sorted((SLOW_POWER_MIN, SLOW_POWER_MAX))
+AGGR_MIN, AGGR_MAX = sorted((AGGR_MIN, AGGR_MAX))
 
 os.makedirs("models", exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def resolve_training_device():
+    """Prefer DirectML on Windows; safely fall back to CUDA/CPU."""
+    requested = os.getenv("TRAIN_DEVICE", "auto").strip()
+    if requested and requested.lower() != "auto":
+        return requested, f"forced by TRAIN_DEVICE={requested}"
+
+    if os.name == "nt":
+        try:
+            import importlib
+
+            torch_directml = importlib.import_module("torch_directml")
+            dml_device = torch_directml.device()
+            _ = torch.zeros(1, device=dml_device)
+            return dml_device, "DirectML"
+        except Exception as exc:
+            console.print(f"[yellow]DirectML unavailable ({exc}). Falling back.[/yellow]")
+
+    if torch.cuda.is_available():
+        return "cuda", "CUDA"
+
+    return "cpu", "CPU"
 
 
 # ─────────────────────────────────────────────
@@ -86,16 +138,62 @@ def train():
         "[white]Training PPO Agent...[/white]",
         border_style="cyan"
     ))
+    console.print(
+        f"[dim]Grid limit curriculum: {GRID_LIMIT_MIN:.0f}% → {GRID_LIMIT_MAX:.0f}% | "
+        f"Eval limit: {EVAL_GRID_LIMIT:.0f}%[/dim]"
+    )
+    console.print(
+        f"[dim]Rate curriculum F/S: {FAST_RATE_MIN:.1f}-{FAST_RATE_MAX:.1f} / "
+        f"{SLOW_RATE_MIN:.1f}-{SLOW_RATE_MAX:.1f} %/min[/dim]"
+    )
+    console.print(
+        f"[dim]Power curriculum F/S: {FAST_POWER_MIN:.1f}-{FAST_POWER_MAX:.1f} / "
+        f"{SLOW_POWER_MIN:.1f}-{SLOW_POWER_MAX:.1f} units | "
+        f"Aggressiveness: {AGGR_MIN:.2f}-{AGGR_MAX:.2f}[/dim]"
+    )
+
+    training_device, device_note = resolve_training_device()
+    console.print(f"[dim]Training device: {training_device} ({device_note})[/dim]")
 
     # ── Step 1: Create vectorized environment ────────────────────────
     # make_vec_env runs N_ENVS copies of the environment in parallel.
     # This means we collect 4x more experience per second → faster training.
     console.print(f"\n[yellow]⚙ Creating {N_ENVS} parallel environments...[/yellow]")
-    vec_env = make_vec_env(EVChargingEnv, n_envs=N_ENVS)
+
+    def make_training_env():
+        return EVChargingEnv(
+            grid_limit_pct=EVAL_GRID_LIMIT,
+            randomize_grid_limit=True,
+            grid_limit_range=(GRID_LIMIT_MIN, GRID_LIMIT_MAX),
+            fast_charge_rate=EVAL_FAST_RATE,
+            slow_charge_rate=EVAL_SLOW_RATE,
+            fast_power=EVAL_FAST_POWER,
+            slow_power=EVAL_SLOW_POWER,
+            aggressiveness=EVAL_AGGR,
+            soft_margin=SOFT_MARGIN,
+            randomize_control_params=True,
+            fast_rate_range=(FAST_RATE_MIN, FAST_RATE_MAX),
+            slow_rate_range=(SLOW_RATE_MIN, SLOW_RATE_MAX),
+            fast_power_range=(FAST_POWER_MIN, FAST_POWER_MAX),
+            slow_power_range=(SLOW_POWER_MIN, SLOW_POWER_MAX),
+            aggressiveness_range=(AGGR_MIN, AGGR_MAX),
+            allowed_modes=(True, True, True),
+        )
+
+    vec_env = make_vec_env(make_training_env, n_envs=N_ENVS)
 
     # ── Step 2: Create evaluation environment ────────────────────────
     # A separate env just for evaluating policy during training
-    eval_env = Monitor(EVChargingEnv())
+    eval_env = Monitor(EVChargingEnv(
+        grid_limit_pct=EVAL_GRID_LIMIT,
+        fast_charge_rate=EVAL_FAST_RATE,
+        slow_charge_rate=EVAL_SLOW_RATE,
+        fast_power=EVAL_FAST_POWER,
+        slow_power=EVAL_SLOW_POWER,
+        aggressiveness=EVAL_AGGR,
+        soft_margin=SOFT_MARGIN,
+        allowed_modes=(True, True, True),
+    ))
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="models/best/",
@@ -116,7 +214,7 @@ def train():
     #   Output: 13 probabilities (one per charging profile)
     console.print("[yellow]⚙ Initializing PPO algorithm...[/yellow]")
 
-    # 3-layer network for richer feature extraction on 102-dim observation
+    # 3-layer network for richer feature extraction on high-dimensional observation
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])
     )
@@ -141,6 +239,7 @@ def train():
         max_grad_norm   = 0.5,             # Gradient clipping for stability
         policy_kwargs   = policy_kwargs,
         tensorboard_log = LOG_DIR,         # Log for TensorBoard visualization
+        device          = training_device,
         verbose         = 0,
     )
 
@@ -164,7 +263,16 @@ def train():
 
     # ── Step 6: Quick sanity check ────────────────────────────────────
     console.print("\n[yellow]🔍 Running quick sanity check (10 episodes)...[/yellow]")
-    test_env  = EVChargingEnv()
+    test_env = EVChargingEnv(
+        grid_limit_pct=EVAL_GRID_LIMIT,
+        fast_charge_rate=EVAL_FAST_RATE,
+        slow_charge_rate=EVAL_SLOW_RATE,
+        fast_power=EVAL_FAST_POWER,
+        slow_power=EVAL_SLOW_POWER,
+        aggressiveness=EVAL_AGGR,
+        soft_margin=SOFT_MARGIN,
+        allowed_modes=(True, True, True),
+    )
     total_success = 0
 
     for ep in range(10):

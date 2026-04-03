@@ -32,6 +32,13 @@ console = Console()
 
 MODEL_PATH = "models/ev_ppo_agent"
 N_EVAL_EPS = 100   # Episodes to evaluate on
+EVAL_GRID_LIMIT = float(os.getenv("EVAL_GRID_LIMIT", "100"))
+EVAL_FAST_RATE = float(os.getenv("EVAL_FAST_RATE", "10"))
+EVAL_SLOW_RATE = float(os.getenv("EVAL_SLOW_RATE", "5"))
+EVAL_FAST_POWER = float(os.getenv("EVAL_FAST_POWER", "3"))
+EVAL_SLOW_POWER = float(os.getenv("EVAL_SLOW_POWER", "1"))
+EVAL_AGGR = float(os.getenv("EVAL_AGGR", "1.05"))
+EVAL_SOFT_MARGIN = float(os.getenv("EVAL_SOFT_MARGIN", "5.0"))
 
 
 # ─────────────────────────────────────────────
@@ -39,11 +46,11 @@ N_EVAL_EPS = 100   # Episodes to evaluate on
 # ─────────────────────────────────────────────
 def baseline_agent(obs):
     """
-    Dumb baseline: always pick action 8 (charge ALL cars at full speed).
+    Dumb baseline: always pick all-fast profile.
     This represents the "before RL" behavior — everyone plugs in and maxes out.
     It will overload the grid during peak hours.
     """
-    return 12  # Profile 12 = all 50 cars on FAST charge
+    return 11  # Profile 11 = all 50 cars on FAST charge
 
 
 # ─────────────────────────────────────────────
@@ -134,7 +141,7 @@ def plot_comparison(ppo_results, baseline_results):
     ax2.set_facecolor(PANEL)
     bp = ax2.boxplot(
         [baseline_results["success_rates"], ppo_results["success_rates"]],
-        labels=["Baseline\n(Naive)", "PPO Agent\n(Trained)"],
+        tick_labels=["Baseline\n(Naive)", "PPO Agent\n(Trained)"],
         patch_artist=True, widths=0.5,
         medianprops=dict(color="white", linewidth=2.5),
         boxprops=dict(linewidth=1.5),
@@ -147,9 +154,9 @@ def plot_comparison(ppo_results, baseline_results):
     bp["fliers"][0].set_markerfacecolor(ORANGE)
     bp["fliers"][1].set_markerfacecolor(BLUE)
 
-    ax2.axhline(80, color=GREEN, linestyle="--", linewidth=1.5, alpha=0.7, label="80% target")
+    ax2.axhline(TARGET_BATTERY, color=GREEN, linestyle="--", linewidth=1.5, alpha=0.7, label=f"{TARGET_BATTERY:.0f}% target")
     ax2.set_title("Cars Successfully Charged (%)", color=TEXT, fontweight="bold", pad=10)
-    ax2.set_ylabel("% Cars with ≥80% Battery at Departure", color=TEXT)
+    ax2.set_ylabel(f"% Cars with ≥{TARGET_BATTERY:.0f}% Battery at Departure", color=TEXT)
     ax2.tick_params(colors=TEXT)
     ax2.spines[:].set_color("#2A2D3A")
     ax2.legend(facecolor=PANEL, labelcolor=TEXT)
@@ -166,10 +173,17 @@ def plot_comparison(ppo_results, baseline_results):
              label="Baseline", alpha=0.9)
     ax3.plot(rolling(ppo_results["grid_peaks"]), color=BLUE, linewidth=1.8,
              label="PPO Agent", alpha=0.9)
-    ax3.axhline(85, color="#FF4444", linestyle="--", linewidth=1.5, alpha=0.8, label="Danger Zone (85%)")
+    ax3.axhline(
+        EVAL_GRID_LIMIT,
+        color="#FF4444",
+        linestyle="--",
+        linewidth=1.5,
+        alpha=0.8,
+        label=f"Danger Zone ({EVAL_GRID_LIMIT:.0f}%)",
+    )
     ax3.fill_between(range(len(rolling(baseline_results["grid_peaks"]))),
-                     85, rolling(baseline_results["grid_peaks"]),
-                     where=[x > 85 for x in rolling(baseline_results["grid_peaks"])],
+                     EVAL_GRID_LIMIT, rolling(baseline_results["grid_peaks"]),
+                     where=[x > EVAL_GRID_LIMIT for x in rolling(baseline_results["grid_peaks"])],
                      color=ORANGE, alpha=0.15)
     ax3.set_title("Peak Grid Load Per Episode (10-ep rolling avg)", color=TEXT, fontweight="bold", pad=10)
     ax3.set_xlabel("Episode", color=TEXT)
@@ -235,7 +249,16 @@ def main():
     # Load model
     console.print("[yellow]Loading model...[/yellow]")
     model = PPO.load(MODEL_PATH)
-    env   = EVChargingEnv()
+    env = EVChargingEnv(
+        grid_limit_pct=EVAL_GRID_LIMIT,
+        fast_charge_rate=EVAL_FAST_RATE,
+        slow_charge_rate=EVAL_SLOW_RATE,
+        fast_power=EVAL_FAST_POWER,
+        slow_power=EVAL_SLOW_POWER,
+        aggressiveness=EVAL_AGGR,
+        soft_margin=EVAL_SOFT_MARGIN,
+        allowed_modes=(True, True, True),
+    )
 
     # Run PPO evaluation
     console.print(f"[yellow]Evaluating PPO agent for {N_EVAL_EPS} episodes...[/yellow]")
@@ -271,7 +294,7 @@ def main():
 
     table.add_row("Avg Reward per Episode",
                   fmt(base_rw), fmt(ppo_rw), improvement(base_rw, ppo_rw))
-    table.add_row("Avg Cars Charged ≥80% (%)",
+    table.add_row(f"Avg Cars Charged ≥{TARGET_BATTERY:.0f}% (%)",
                   fmt(base_sr), fmt(ppo_sr), improvement(base_sr, ppo_sr))
     table.add_row("Avg Peak Grid Load (%)",
                   fmt(base_gp), fmt(ppo_gp), improvement(base_gp, ppo_gp, higher_better=False))

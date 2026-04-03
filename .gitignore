@@ -1,2 +1,29 @@
-./meta/models
-./meta/logs
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+.venv_*/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Training/evaluation artifacts
+logs/
+models/best/
+evaluation_results.png
+
+# Keep primary model checkpoint tracked if desired
+!models/
+!models/ev_ppo_agent.zip
+
+# OS cruft
+.DS_Store
+Thumbs.db

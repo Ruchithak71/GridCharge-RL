@@ -28,11 +28,11 @@ import numpy as np
 # ─────────────────────────────────────────────
 NUM_CARS          = 50       # Number of EVs plugged in simultaneously
 MAX_STEPS         = 180      # Episode length = 180 simulated minutes (3 hours)
-FAST_CHARGE_RATE  = 1.0      # % battery added per minute on fast charge (~60%/hr)
-SLOW_CHARGE_RATE  = 0.4      # % battery added per minute on slow charge (~24%/hr)
+FAST_CHARGE_RATE  = 1.5      # % battery added per minute on fast charge (~90%/hr)
+SLOW_CHARGE_RATE  = 0.5      # % battery added per minute on slow charge (~30%/hr)
 WAIT_CHARGE_RATE  = 0.0      # No charging
 TARGET_BATTERY    = 80.0     # We want every car at ≥ 80% before departure
-GRID_CAPACITY     = 100.0    # Normalized max grid load (%)
+GRID_CAPACITY     = 120.0    # Normalized max grid load (%) — slightly more headroom
 
 # Power drawn from the grid per car (in arbitrary "grid units")
 FAST_POWER  = 3.0
@@ -114,10 +114,11 @@ class EVChargingEnv(gym.Env):
         super().reset(seed=seed)
 
         # Randomize 50 car batteries: each car arrives with 20–60% charge
-        self.battery = self.np_random.uniform(low=20.0, high=60.0, size=NUM_CARS).astype(np.float32)
+        self.battery = self.np_random.uniform(low=25.0, high=65.0, size=NUM_CARS).astype(np.float32)
 
-        # Randomize departure times: cars leave 30–180 minutes from now
-        self.departure = self.np_random.uniform(low=30.0, high=MAX_STEPS, size=NUM_CARS).astype(np.float32)
+        # Randomize departure times: cars leave 45–180 minutes from now
+        # (min 45 min so every car is physically chargeable to 80%)
+        self.departure = self.np_random.uniform(low=45.0, high=MAX_STEPS, size=NUM_CARS).astype(np.float32)
 
         self.current_step  = 0
         self.sim_hour      = 18.0   # Always start at 6 PM
@@ -220,11 +221,14 @@ class EVChargingEnv(gym.Env):
                 newly_departed    += 1
                 if self.battery[i] >= TARGET_BATTERY:
                     self.success_count += 1
-                    step_reward += 30.0    # ✅ Car leaves happy (big reward!)
+                    step_reward += 25.0    # ✅ Car leaves happy!
+                    # Bonus for charging above target (extra satisfaction)
+                    overshoot = min((self.battery[i] - TARGET_BATTERY) / 20.0, 1.0)
+                    step_reward += 5.0 * overshoot
                 else:
                     # Penalty proportional to how short we fell
                     shortfall = (TARGET_BATTERY - self.battery[i]) / TARGET_BATTERY
-                    step_reward -= 20.0 * shortfall   # ❌ Car leaves unhappy
+                    step_reward -= 30.0 * shortfall   # ❌ Car leaves unhappy (stronger penalty)
 
         # ── 6. COMPUTE REWARD ─────────────────────────────────────────
         # 6a. Per-step shaping: reward battery PROGRESS on active cars
@@ -236,20 +240,26 @@ class EVChargingEnv(gym.Env):
             avg_progress = float(np.mean(
                 np.minimum(self.battery[active_now], TARGET_BATTERY)
             )) / TARGET_BATTERY
-            step_reward += 1.0 * avg_progress  # continuous shaping
+            step_reward += 2.0 * avg_progress  # continuous shaping (stronger signal)
 
-            # 6a-extra: Reward for urgently-needed cars getting charged
-            # Small bonus for each active car already above target
+            # Bonus for fraction of active cars already above target
             above_target = np.sum(self.battery[active_now] >= TARGET_BATTERY)
-            step_reward += 0.1 * (above_target / max(active_count, 1))
+            step_reward += 1.0 * (above_target / max(active_count, 1))
 
-        # 6b. Penalize grid stress (exponential above 85%)
-        # Soft penalty — don't let this dominate the reward signal
-        if grid_pct > 85.0:
-            step_reward -= 0.3 * ((grid_pct - 85.0) / 15.0) ** 2
+            # Urgency-aware bonus: extra reward for charging cars that are close to departing
+            time_left = np.maximum(self.departure[active_now] - self.current_step, 1.0)
+            urgent_mask = time_left < 30.0  # cars leaving within 30 min
+            if np.any(urgent_mask):
+                urgent_charged = np.sum(self.battery[active_now][urgent_mask] >= TARGET_BATTERY)
+                step_reward += 2.0 * (urgent_charged / max(np.sum(urgent_mask), 1))
+
+        # 6b. Penalize grid stress (exponential above 90%)
+        # Keep penalty mild so agent isn't afraid to charge
+        if grid_pct > 90.0:
+            step_reward -= 0.2 * ((grid_pct - 90.0) / 20.0) ** 2
 
         # 6c. Small power efficiency cost
-        step_reward -= 0.001 * (fast_count * FAST_POWER + slow_count * SLOW_POWER)
+        step_reward -= 0.0005 * (fast_count * FAST_POWER + slow_count * SLOW_POWER)
 
         # ── 7. TERMINATION CONDITIONS ─────────────────────────────────
         terminated = bool(np.all(self.cars_done))
@@ -258,14 +268,13 @@ class EVChargingEnv(gym.Env):
         # End-of-episode bonus — strongly incentivize high success rates
         if (terminated or truncated):
             success_rate = self.success_count / NUM_CARS
+            # Smooth, continuous end-of-episode bonus (easier gradient)
+            # Quadratic scaling: ramps up aggressively at high success rates
+            step_reward += 400.0 * (success_rate ** 2)
             if success_rate >= 1.0:
-                step_reward += 500.0   # 🏆 Perfect episode!
-            elif success_rate >= 0.9:
-                step_reward += 300.0 * success_rate
-            elif success_rate >= 0.7:
-                step_reward += 150.0 * success_rate
-            else:
-                step_reward -= 50.0 * (1.0 - success_rate)  # Penalize bad episodes
+                step_reward += 200.0   # 🏆 Perfect episode jackpot!
+            elif success_rate < 0.5:
+                step_reward -= 50.0 * (1.0 - success_rate)  # Penalize truly bad episodes
 
         # ── 8. EXTRA INFO (for logging/analysis) ──────────────────────
         info = {

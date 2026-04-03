@@ -116,27 +116,27 @@ def train():
     #   Output: 13 probabilities (one per charging profile)
     console.print("[yellow]⚙ Initializing PPO algorithm...[/yellow]")
 
-    # Wider network for the 102-dim observation space with 13-action output
+    # 3-layer network for richer feature extraction on 102-dim observation
     policy_kwargs = dict(
-        net_arch=dict(pi=[256, 256], vf=[256, 256])  # Wider layers for better representation
+        net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])
     )
 
     # Linear learning rate schedule: starts at 3e-4, decays to 0
     def lr_schedule(progress_remaining):
-        """Linear decay: 1.0 at start → 0.0 at end."""
-        return 3e-4 * progress_remaining
+        """Linear decay: starts at 3e-4, decays to 3e-5 (not zero — keeps learning)."""
+        return 3e-5 + (3e-4 - 3e-5) * progress_remaining
 
     model = PPO(
         policy          = "MlpPolicy",    # Feedforward neural network
         env             = vec_env,
-        learning_rate   = lr_schedule,     # Linear decay for fine convergence
-        n_steps         = 4096,            # Steps collected before each policy update
-        batch_size      = 256,             # Larger batch → smoother gradient estimates
-        n_epochs        = 10,              # Times to reuse each batch of data
+        learning_rate   = lr_schedule,     # Linear decay with floor for fine convergence
+        n_steps         = 2048,            # Steps per update (2048 * 8 envs = 16k/update)
+        batch_size      = 128,             # Smaller batches → more gradient updates per rollout
+        n_epochs        = 15,              # More passes over each batch → better sample efficiency
         clip_range      = 0.2,             # Standard PPO clip range
-        gamma           = 0.995,           # High discount: strongly value future rewards
-        gae_lambda      = 0.98,            # Higher λ for less-biased advantage estimates
-        ent_coef        = 0.05,            # More exploration early (13 actions need it)
+        gamma           = 0.99,            # Discount factor (0.99 fits 180-step episodes well)
+        gae_lambda      = 0.95,            # Standard GAE lambda for stable advantages
+        ent_coef        = 0.01,            # Mild exploration (13 actions don't need much)
         vf_coef         = 0.5,             # Value function loss weight
         max_grad_norm   = 0.5,             # Gradient clipping for stability
         policy_kwargs   = policy_kwargs,
